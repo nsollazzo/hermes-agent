@@ -181,9 +181,9 @@ def wait_for_container_ready(
     container: str,
     *,
     deadline_s: float = 30.0,
-    interval_s: float = 0.25,
+    interval_s: float = 0.25,  # noqa: ARG001 — kept for API compat
 ) -> None:
-    """Poll until the container has finished s6 cont-init (stage2 + reconcile).
+    """Block until the container has finished s6 cont-init (stage2 + reconcile).
 
     The readiness signal is ``profile=default`` appearing in
     ``/opt/data/logs/container-boot.log``, which the 02-reconcile-profiles
@@ -192,24 +192,38 @@ def wait_for_container_ready(
     cont-init chain (UID remap, chown, config seeding, skills sync,
     browser discovery, config migration) has run.
 
+    Implementation: a single ``docker exec`` that runs an ``until`` loop
+    *inside* the container, sleeping 0.1s between checks. This replaces
+    the previous N-times-docker-exec polling loop, eliminating (N-1)
+    docker exec fork/connect round-trips and (N-1) host-side sleeps
+    per container — each poll was a ~0.22s subprocess + 0.25s sleep, and
+    containers typically needed 3-7 polls. The in-container ``sleep 0.1``
+    is free (no docker overhead) and detects readiness with less
+    overshoot (0.1s vs 0.25s).
+
     Raises ``TimeoutError`` if the container never becomes ready — much
     better than a fixed ``time.sleep()`` that either wastes time on fast
     machines or flakes on slow ones.
     """
-    end = time.monotonic() + deadline_s
-    while time.monotonic() < end:
-        r = docker_exec(
-            container,
-            "sh", "-c",
-            "cat /opt/data/logs/container-boot.log 2>/dev/null",
-            timeout=5,
-        )
-        if r.returncode == 0 and "profile=default" in r.stdout:
-            return
-        time.sleep(interval_s)
-    raise TimeoutError(
-        f"container {container} did not finish cont-init within {deadline_s}s"
+    probe = (
+        'until grep -q "profile=default" /opt/data/logs/container-boot.log'
+        " 2>/dev/null; do sleep 0.1; done"
     )
+    try:
+        r = docker_exec(
+            container, "sh", "-c", probe,
+            user="root",
+            timeout=int(deadline_s),
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(
+            f"container {container} did not finish cont-init within {deadline_s}s"
+        )
+    if r.returncode != 0:
+        raise TimeoutError(
+            f"container {container} cont-init probe exited {r.returncode} "
+            f"within {deadline_s}s: {r.stderr[-500:]!r}"
+        )
 
 
 def start_container(
